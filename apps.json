@@ -16,6 +16,10 @@
     "path": "\"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe\""
   },
   {
+    "name": "music",
+    "path": "\"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\chrome_proxy.exe\" --profile-directory=Default --app-id=cinhimbnkkaeohfgghhklpknlkffjgod"
+  },
+  {
     "name": "youtube",
     "path": "\"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\chrome_proxy.exe\" --profile-directory=Default --app-id=agimnkijcaahngcdmfeangaknmldooml"
   }

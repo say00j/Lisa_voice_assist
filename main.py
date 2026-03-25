@@ -72,39 +72,70 @@ def _strip_wrapping_quotes(value: str) -> str:
     return value
 
 
+def _split_argument_text(argument_text: str) -> list[str]:
+    try:
+        parts = shlex.split(argument_text, posix=False)
+    except ValueError as exc:
+        raise ValueError(f"Invalid launch command: {exc}") from exc
+
+    return [_strip_wrapping_quotes(part) for part in parts]
+
+
+def _resolve_executable_candidate(candidate_text: str) -> Optional[Path]:
+    raw_value = _strip_wrapping_quotes(candidate_text.strip())
+    if not raw_value:
+        return None
+
+    executable_path = Path(os.path.expandvars(raw_value)).expanduser()
+    try:
+        resolved_executable = executable_path.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    if not resolved_executable.is_file():
+        return None
+
+    return resolved_executable
+
+
+def _validate_supported_executable(executable_path: Path) -> None:
+    if executable_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ValueError(f"Select a valid executable file ({allowed}).")
+
+
 def split_launch_command(command_text: str) -> list[str]:
     expanded_text = os.path.expandvars(command_text).strip()
     if not expanded_text:
         raise ValueError("Launch command cannot be empty.")
 
-    try:
-        parts = shlex.split(expanded_text, posix=False)
-    except ValueError as exc:
-        raise ValueError(f"Invalid launch command: {exc}") from exc
+    parsed_parts = _split_argument_text(expanded_text)
+    if parsed_parts:
+        resolved_executable = _resolve_executable_candidate(parsed_parts[0])
+        if resolved_executable is not None:
+            _validate_supported_executable(resolved_executable)
+            return [str(resolved_executable), *parsed_parts[1:]]
 
-    if not parts:
-        raise ValueError("Launch command cannot be empty.")
+    boundary_positions = [match.start() for match in re.finditer(r"\s+", expanded_text)]
+    boundary_positions.append(len(expanded_text))
 
-    return [_strip_wrapping_quotes(part) for part in parts]
+    for boundary in boundary_positions:
+        executable_candidate = expanded_text[:boundary].strip()
+        resolved_executable = _resolve_executable_candidate(executable_candidate)
+        if resolved_executable is None:
+            continue
+
+        _validate_supported_executable(resolved_executable)
+        remainder_text = expanded_text[boundary:].strip()
+        remainder_parts = _split_argument_text(remainder_text) if remainder_text else []
+        return [str(resolved_executable), *remainder_parts]
+
+    raise ValueError("Executable file was not found.")
 
 
 def normalize_launch_command(command_text: str) -> tuple[str, Path]:
     parts = split_launch_command(command_text)
-    executable_path = Path(parts[0]).expanduser()
-
-    try:
-        resolved_executable = executable_path.resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise ValueError("Executable file was not found.") from exc
-    except OSError as exc:
-        raise ValueError(f"Executable path could not be resolved: {exc}") from exc
-
-    if not resolved_executable.is_file():
-        raise ValueError("Executable path must point to a file.")
-
-    if resolved_executable.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise ValueError(f"Select a valid executable file ({allowed}).")
+    resolved_executable = Path(parts[0])
 
     normalized_command = subprocess.list2cmdline([str(resolved_executable), *parts[1:]])
     return normalized_command, resolved_executable
