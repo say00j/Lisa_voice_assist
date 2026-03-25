@@ -1,0 +1,22 @@
+[
+  {
+    "name": "blend",
+    "path": "\"C:\\Program Files\\Blender Foundation\\Blender 4.0\\blender.exe\""
+  },
+  {
+    "name": "file",
+    "path": "C:\\Windows\\explorer.exe"
+  },
+  {
+    "name": "game",
+    "path": "\"C:\\Games\\Rise of the Tomb Raider\\ROTTR.exe\""
+  },
+  {
+    "name": "google",
+    "path": "\"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe\""
+  },
+  {
+    "name": "youtube",
+    "path": "\"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\chrome_proxy.exe\" --profile-directory=Default --app-id=agimnkijcaahngcdmfeangaknmldooml"
+  }
+]
