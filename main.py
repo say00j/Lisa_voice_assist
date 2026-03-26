@@ -43,14 +43,25 @@ from PySide6.QtWidgets import (
 
 APP_TITLE = "LISA \u2014 Voice App Launcher"
 APPS_FILE_NAME = "apps.json"
+APP_DATA_DIR_NAME = "LISA"
 AUTO_START_LISTENING = False
 MIC_CALIBRATION_SECONDS = 1.0
 LISTEN_TIMEOUT_SECONDS = 1.0
 PHRASE_TIME_LIMIT_SECONDS = 5.0
 STOP_WAIT_TIMEOUT_MS = 7000
 SUPPORTED_EXTENSIONS = {".exe", ".bat", ".cmd", ".com"}
-BASE_DIR = Path(__file__).resolve().parent
-APPS_FILE = BASE_DIR / APPS_FILE_NAME
+
+
+def get_app_data_dir() -> Path:
+    local_appdata = os.getenv("LOCALAPPDATA")
+    base_dir = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+    app_data_dir = base_dir / APP_DATA_DIR_NAME
+    app_data_dir.mkdir(parents=True, exist_ok=True)
+    return app_data_dir
+
+
+APP_DATA_DIR = get_app_data_dir()
+APPS_FILE = APP_DATA_DIR / APPS_FILE_NAME
 
 
 def current_timestamp() -> str:
@@ -154,7 +165,7 @@ class AppRegistry:
 
     def load(self) -> list[str]:
         self.entries = []
-        messages: list[str] = []
+        messages = self._migrate_legacy_file()
 
         if not self.file_path.exists():
             return messages
@@ -194,6 +205,7 @@ class AppRegistry:
         return messages
 
     def save(self) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
         payload = [{"name": entry.name, "path": entry.path} for entry in self.entries]
         self.file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -277,6 +289,43 @@ class AppRegistry:
 
     def _sort_entries(self) -> None:
         self.entries.sort(key=lambda entry: normalize_name(entry.name))
+
+    def _legacy_file_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        seen_paths: set[Path] = set()
+
+        base_candidates = [Path(sys.executable).resolve().parent / APPS_FILE_NAME]
+        if "__file__" in globals():
+            base_candidates.append(Path(__file__).resolve().parent / APPS_FILE_NAME)
+
+        for candidate in base_candidates:
+            if candidate == self.file_path or candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
+            candidates.append(candidate)
+
+        return candidates
+
+    def _migrate_legacy_file(self) -> list[str]:
+        messages: list[str] = []
+        if self.file_path.exists():
+            return messages
+
+        for candidate in self._legacy_file_candidates():
+            if not candidate.exists():
+                continue
+
+            try:
+                self.file_path.parent.mkdir(parents=True, exist_ok=True)
+                self.file_path.write_text(candidate.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception as exc:
+                messages.append(f"Failed to migrate app list from '{candidate}': {exc}")
+                continue
+
+            messages.append(f"Migrated app list from '{candidate}'.")
+            break
+
+        return messages
 
 
 class AppDialog(QDialog):
@@ -475,6 +524,7 @@ class LisaMainWindow(QMainWindow):
         self._set_mic_state("inactive")
 
         self.append_log("INFO", "App started")
+        self.append_log("INFO", f"Using app registry file: {self.registry.file_path}")
         self.append_log("INFO", f"Loaded {len(self.registry.entries)} registered application(s)")
 
         self.toggle_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
