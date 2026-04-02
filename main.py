@@ -7,11 +7,12 @@ import shlex
 import subprocess
 import sys
 import time
+import winreg
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Event
-from typing import Optional
+from typing import Callable, Optional
 
 import speech_recognition as sr
 from PySide6.QtCore import QThread, Qt, QTimer, Signal, Slot
@@ -45,11 +46,42 @@ APP_TITLE = "LISA \u2014 Voice App Launcher"
 APPS_FILE_NAME = "apps.json"
 APP_DATA_DIR_NAME = "LISA"
 AUTO_START_LISTENING = False
+AUTO_SCAN_INSTALLED_APPS_ON_STARTUP = True
 MIC_CALIBRATION_SECONDS = 1.0
 LISTEN_TIMEOUT_SECONDS = 1.0
 PHRASE_TIME_LIMIT_SECONDS = 5.0
 STOP_WAIT_TIMEOUT_MS = 7000
 SUPPORTED_EXTENSIONS = {".exe", ".bat", ".cmd", ".com"}
+UNINSTALL_REGISTRY_PATHS = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+)
+APP_PATHS_REGISTRY_PATHS = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+)
+IGNORED_AUTO_IMPORT_NAME_KEYWORDS = {
+    "driver",
+    "hotfix",
+    "redistributable",
+    "runtime",
+    "security update",
+    "sdk",
+    "update helper",
+}
+IGNORED_AUTO_IMPORT_EXECUTABLE_STEMS = {
+    "applyupdate",
+    "autoupdate",
+    "crashpad_handler",
+    "elevate",
+    "helper",
+    "installer",
+    "setup",
+    "unins000",
+    "uninstall",
+    "update",
+    "updater",
+}
 
 
 def get_app_data_dir() -> Path:
@@ -158,6 +190,248 @@ class AppEntry:
     path: str
 
 
+def _read_registry_text(key: winreg.HKEYType, value_name: str = "") -> Optional[str]:
+    try:
+        value, _ = winreg.QueryValueEx(key, value_name)
+    except FileNotFoundError:
+        return None
+
+    if not isinstance(value, str):
+        return None
+
+    text_value = value.strip()
+    return text_value or None
+
+
+def _strip_display_icon_suffix(value: str) -> str:
+    return re.sub(r",\s*-?\d+\s*$", "", value.strip())
+
+
+def _clean_auto_import_name(name: str) -> str:
+    cleaned = re.sub(r"\s+\((x64|x86)\)\s*$", "", name, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+\d+(?:\.\d+){1,}\s*$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or name.strip()
+
+
+def _is_meaningful_auto_import(name: str, executable_path: Path) -> bool:
+    normalized_name = normalize_name(name)
+    if not normalized_name:
+        return False
+
+    for keyword in IGNORED_AUTO_IMPORT_NAME_KEYWORDS:
+        if keyword in normalized_name:
+            return False
+
+    if executable_path.stem.casefold() in IGNORED_AUTO_IMPORT_EXECUTABLE_STEMS:
+        return False
+
+    return True
+
+
+def _find_best_executable_in_install_location(install_location: str, display_name: str) -> Optional[str]:
+    expanded_location = Path(os.path.expandvars(install_location)).expanduser()
+    try:
+        install_dir = expanded_location.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    if not install_dir.is_dir():
+        return None
+
+    try:
+        executable_candidates = [
+            path
+            for path in install_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".exe"
+        ]
+    except OSError:
+        return None
+
+    if not executable_candidates:
+        return None
+
+    normalized_name = normalize_name(display_name)
+    display_tokens = {token for token in re.split(r"[^a-z0-9]+", normalized_name) if token}
+
+    def score(path: Path) -> tuple[int, int, str]:
+        stem = path.stem.casefold()
+        token_score = sum(1 for token in display_tokens if token and token in stem)
+        preferred = 0 if stem not in IGNORED_AUTO_IMPORT_EXECUTABLE_STEMS else -5
+        return (token_score, preferred, stem)
+
+    best_candidate = max(executable_candidates, key=score)
+    try:
+        normalized_command, _ = normalize_launch_command(str(best_candidate))
+    except ValueError:
+        return None
+    return normalized_command
+
+
+class InstalledAppScanner:
+    def __init__(self, log_callback: Optional[Callable[[str, str], None]] = None) -> None:
+        self.log_callback = log_callback
+
+    def scan(self) -> list[AppEntry]:
+        discovered_by_name: dict[str, AppEntry] = {}
+        discovered_commands: set[str] = set()
+
+        self._log("INFO", "Scanning Windows App Paths registry")
+        self._scan_app_paths(discovered_by_name, discovered_commands)
+
+        self._log("INFO", "Scanning Windows uninstall registry")
+        self._scan_uninstall_entries(discovered_by_name, discovered_commands)
+
+        return sorted(discovered_by_name.values(), key=lambda entry: normalize_name(entry.name))
+
+    def _scan_app_paths(
+        self,
+        discovered_by_name: dict[str, AppEntry],
+        discovered_commands: set[str],
+    ) -> None:
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for key_path in APP_PATHS_REGISTRY_PATHS:
+                try:
+                    registry_key = winreg.OpenKey(root, key_path)
+                except FileNotFoundError:
+                    continue
+
+                with registry_key:
+                    subkey_count = winreg.QueryInfoKey(registry_key)[0]
+                    for index in range(subkey_count):
+                        try:
+                            subkey_name = winreg.EnumKey(registry_key, index)
+                            with winreg.OpenKey(registry_key, subkey_name) as subkey:
+                                raw_command = _read_registry_text(subkey)
+                        except OSError:
+                            continue
+
+                        if not raw_command:
+                            continue
+
+                        try:
+                            normalized_command, executable_path = normalize_launch_command(raw_command)
+                        except ValueError:
+                            continue
+
+                        app_name = Path(subkey_name).stem.strip().lower()
+                        if not app_name:
+                            app_name = executable_path.stem.lower()
+
+                        self._register_discovered_entry(
+                            discovered_by_name,
+                            discovered_commands,
+                            app_name,
+                            normalized_command,
+                            executable_path,
+                        )
+
+    def _scan_uninstall_entries(
+        self,
+        discovered_by_name: dict[str, AppEntry],
+        discovered_commands: set[str],
+    ) -> None:
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for key_path in UNINSTALL_REGISTRY_PATHS:
+                try:
+                    registry_key = winreg.OpenKey(root, key_path)
+                except FileNotFoundError:
+                    continue
+
+                with registry_key:
+                    subkey_count = winreg.QueryInfoKey(registry_key)[0]
+                    for index in range(subkey_count):
+                        try:
+                            subkey_name = winreg.EnumKey(registry_key, index)
+                            with winreg.OpenKey(registry_key, subkey_name) as subkey:
+                                display_name = _read_registry_text(subkey, "DisplayName")
+                                if not display_name:
+                                    continue
+
+                                normalized_command, executable_path = self._command_from_uninstall_entry(subkey, display_name)
+                        except OSError:
+                            continue
+
+                        if not normalized_command or executable_path is None:
+                            continue
+
+                        self._register_discovered_entry(
+                            discovered_by_name,
+                            discovered_commands,
+                            _clean_auto_import_name(display_name),
+                            normalized_command,
+                            executable_path,
+                        )
+
+    def _command_from_uninstall_entry(
+        self,
+        subkey: winreg.HKEYType,
+        display_name: str,
+    ) -> tuple[Optional[str], Optional[Path]]:
+        display_icon = _read_registry_text(subkey, "DisplayIcon")
+        if display_icon:
+            candidate_command = _strip_display_icon_suffix(display_icon)
+            try:
+                return normalize_launch_command(candidate_command)
+            except ValueError:
+                pass
+
+        install_location = _read_registry_text(subkey, "InstallLocation")
+        if install_location:
+            candidate_command = _find_best_executable_in_install_location(install_location, display_name)
+            if candidate_command:
+                try:
+                    return normalize_launch_command(candidate_command)
+                except ValueError:
+                    pass
+
+        return None, None
+
+    def _register_discovered_entry(
+        self,
+        discovered_by_name: dict[str, AppEntry],
+        discovered_commands: set[str],
+        app_name: str,
+        command_text: str,
+        executable_path: Path,
+    ) -> None:
+        cleaned_name = _clean_auto_import_name(app_name)
+        normalized_name_key = normalize_name(cleaned_name)
+        normalized_command_key = normalize_name(command_text)
+
+        if not normalized_name_key or normalized_command_key in discovered_commands:
+            return
+
+        if normalized_name_key in discovered_by_name:
+            return
+
+        if not _is_meaningful_auto_import(cleaned_name, executable_path):
+            return
+
+        discovered_by_name[normalized_name_key] = AppEntry(name=cleaned_name, path=command_text)
+        discovered_commands.add(normalized_command_key)
+
+    def _log(self, level: str, message: str) -> None:
+        if self.log_callback is not None:
+            self.log_callback(level, message)
+
+
+class InstalledAppsScanWorker(QThread):
+    log_event = Signal(str, str)
+    scan_complete = Signal(object)
+
+    def run(self) -> None:
+        try:
+            scanner = InstalledAppScanner(self.log_event.emit)
+            entries = scanner.scan()
+        except Exception as exc:
+            self.log_event.emit("ERROR", f"Installed app scan failed: {exc}")
+            self.scan_complete.emit([])
+            return
+
+        self.scan_complete.emit(entries)
+
+
 class AppRegistry:
     def __init__(self, file_path: Path) -> None:
         self.file_path = file_path
@@ -236,6 +510,30 @@ class AppRegistry:
                 return
 
         raise KeyError(f"Application '{original_name}' was not found.")
+
+    def merge_entries(self, entries: list[AppEntry]) -> tuple[list[str], list[str]]:
+        existing_names = {normalize_name(entry.name) for entry in self.entries}
+        existing_commands = {entry.path.casefold() for entry in self.entries}
+        added_names: list[str] = []
+        skipped_names: list[str] = []
+
+        for entry in entries:
+            normalized_name = normalize_name(entry.name)
+            normalized_command = entry.path.casefold()
+            if normalized_name in existing_names or normalized_command in existing_commands:
+                skipped_names.append(entry.name)
+                continue
+
+            self.entries.append(entry)
+            existing_names.add(normalized_name)
+            existing_commands.add(normalized_command)
+            added_names.append(entry.name)
+
+        if added_names:
+            self._sort_entries()
+            self.save()
+
+        return added_names, skipped_names
 
     def delete_entry(self, name: str) -> None:
         target = normalize_name(name)
@@ -507,6 +805,7 @@ class LisaMainWindow(QMainWindow):
         super().__init__()
         self.registry = AppRegistry(APPS_FILE)
         self.speech_worker: Optional[SpeechWorker] = None
+        self.installed_apps_worker: Optional[InstalledAppsScanWorker] = None
         self.is_listening = False
         self._is_closing = False
         self._stop_requested = False
@@ -532,6 +831,8 @@ class LisaMainWindow(QMainWindow):
 
         if AUTO_START_LISTENING:
             QTimer.singleShot(300, self.start_listening)
+        if AUTO_SCAN_INSTALLED_APPS_ON_STARTUP:
+            QTimer.singleShot(500, self.scan_installed_apps)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -619,12 +920,16 @@ class LisaMainWindow(QMainWindow):
         self.browse_button = QPushButton("Browse for Executable")
         self.browse_button.clicked.connect(self.browse_for_app)
 
+        self.scan_button = QPushButton("Scan Installed Apps")
+        self.scan_button.clicked.connect(self.scan_installed_apps)
+
         app_button_layout = QHBoxLayout()
         app_button_layout.setSpacing(10)
         app_button_layout.addWidget(self.add_button)
         app_button_layout.addWidget(self.edit_button)
         app_button_layout.addWidget(self.delete_button)
         app_button_layout.addWidget(self.browse_button)
+        app_button_layout.addWidget(self.scan_button)
         app_button_layout.addStretch(1)
 
         app_group = QGroupBox("Application Manager")
@@ -780,11 +1085,13 @@ class LisaMainWindow(QMainWindow):
     def _update_action_buttons(self) -> None:
         has_selection = self._selected_entry() is not None
         listening_thread_active = self.speech_worker is not None and self.speech_worker.isRunning()
+        scan_thread_active = self.installed_apps_worker is not None and self.installed_apps_worker.isRunning()
 
         self.edit_button.setEnabled(has_selection)
         self.delete_button.setEnabled(has_selection)
         self.start_button.setEnabled(not listening_thread_active)
         self.stop_button.setEnabled(listening_thread_active)
+        self.scan_button.setEnabled(not scan_thread_active)
 
     def _existing_name_set(self) -> set[str]:
         return {normalize_name(entry.name) for entry in self.registry.entries}
@@ -880,6 +1187,53 @@ class LisaMainWindow(QMainWindow):
 
         self._refresh_table()
         self.append_log("ACTION", f"Deleted app '{entry.name}'")
+
+    @Slot()
+    def scan_installed_apps(self) -> None:
+        if self.installed_apps_worker is not None and self.installed_apps_worker.isRunning():
+            self.append_log("WARNING", "Installed app scan is already running")
+            return
+
+        self.installed_apps_worker = InstalledAppsScanWorker()
+        self.installed_apps_worker.log_event.connect(self.append_log)
+        self.installed_apps_worker.scan_complete.connect(self._handle_scan_complete)
+        self.installed_apps_worker.finished.connect(self._cleanup_scan_worker)
+        self.installed_apps_worker.start()
+
+        self.append_log("INFO", "Installed app scan started")
+        self._update_action_buttons()
+
+    @Slot(object)
+    def _handle_scan_complete(self, entries: object) -> None:
+        discovered_entries = list(entries) if isinstance(entries, list) else []
+        if not discovered_entries:
+            self.append_log("INFO", "Installed app scan finished with no new launchable entries")
+            return
+
+        try:
+            added_names, skipped_names = self.registry.merge_entries(discovered_entries)
+        except Exception as exc:
+            self.append_log("ERROR", f"Failed to merge scanned apps: {exc}")
+            QMessageBox.critical(self, "Import Error", f"Could not import scanned apps:\n{exc}")
+            return
+
+        self._refresh_table(select_name=added_names[0] if added_names else "")
+        self.append_log(
+            "INFO",
+            f"Installed app scan finished: added {len(added_names)}, skipped {len(skipped_names)} duplicates",
+        )
+
+    @Slot()
+    def _cleanup_scan_worker(self) -> None:
+        if self.installed_apps_worker is None:
+            return
+
+        if self.installed_apps_worker.isRunning():
+            return
+
+        self.installed_apps_worker.deleteLater()
+        self.installed_apps_worker = None
+        self._update_action_buttons()
 
     @Slot()
     def start_listening(self) -> None:
@@ -1054,6 +1408,9 @@ class LisaMainWindow(QMainWindow):
         if self.speech_worker is not None and self.speech_worker.isRunning():
             self.speech_worker.stop()
             self.speech_worker.wait(STOP_WAIT_TIMEOUT_MS)
+
+        if self.installed_apps_worker is not None and self.installed_apps_worker.isRunning():
+            self.installed_apps_worker.wait(STOP_WAIT_TIMEOUT_MS)
 
         event.accept()
 
