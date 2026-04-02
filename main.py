@@ -60,6 +60,12 @@ APP_PATHS_REGISTRY_PATHS = (
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
     r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
 )
+BROWSER_WEB_APP_EXECUTABLES = {
+    "brave.exe",
+    "brave_proxy.exe",
+    "chrome.exe",
+    "chrome_proxy.exe",
+}
 IGNORED_AUTO_IMPORT_NAME_KEYWORDS = {
     "driver",
     "hotfix",
@@ -90,6 +96,33 @@ def get_app_data_dir() -> Path:
     app_data_dir = base_dir / APP_DATA_DIR_NAME
     app_data_dir.mkdir(parents=True, exist_ok=True)
     return app_data_dir
+
+
+def get_shortcut_scan_roots() -> list[Path]:
+    roots: list[Path] = []
+    env_names = ("APPDATA", "PROGRAMDATA", "USERPROFILE", "PUBLIC")
+    seen_paths: set[Path] = set()
+
+    for env_name in env_names:
+        env_value = os.getenv(env_name)
+        if not env_value:
+            continue
+
+        base_path = Path(env_value)
+        if env_name == "APPDATA":
+            candidates = [base_path / "Microsoft" / "Windows" / "Start Menu" / "Programs"]
+        elif env_name == "PROGRAMDATA":
+            candidates = [base_path / "Microsoft" / "Windows" / "Start Menu" / "Programs"]
+        else:
+            candidates = [base_path / "Desktop"]
+
+        for candidate in candidates:
+            if candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
+            roots.append(candidate)
+
+    return roots
 
 
 APP_DATA_DIR = get_app_data_dir()
@@ -268,6 +301,92 @@ def _find_best_executable_in_install_location(install_location: str, display_nam
     return normalized_command
 
 
+def _clean_browser_web_app_name(name: str) -> str:
+    cleaned = re.sub(
+        r"\s+-\s+(Brave|Google Chrome|Chrome|Chrome Apps)$",
+        "",
+        name.strip(),
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+\((Chrome App|Brave App)\)$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or name.strip()
+
+
+def _is_browser_web_app_shortcut(target_path: Path, arguments: str) -> bool:
+    if "--app-id=" not in arguments.casefold():
+        return False
+
+    return target_path.name.casefold() in BROWSER_WEB_APP_EXECUTABLES
+
+
+def _read_shortcuts_via_powershell(shortcut_roots: list[Path]) -> list[dict[str, str]]:
+    existing_roots = [path for path in shortcut_roots if path.exists()]
+    if not existing_roots:
+        return []
+
+    def quote_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    roots_literal = ", ".join(quote_literal(str(path)) for path in existing_roots)
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject WScript.Shell
+$roots = @({roots_literal})
+$items = foreach ($root in $roots) {{
+    if (Test-Path -LiteralPath $root) {{
+        Get-ChildItem -LiteralPath $root -Filter *.lnk -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {{
+            try {{
+                $shortcut = $shell.CreateShortcut($_.FullName)
+                [PSCustomObject]@{{
+                    Name = $_.BaseName
+                    ShortcutPath = $_.FullName
+                    TargetPath = $shortcut.TargetPath
+                    Arguments = $shortcut.Arguments
+                }}
+            }} catch {{
+            }}
+        }}
+    }}
+}}
+$items | ConvertTo-Json -Compress
+"""
+
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=45,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    output = completed.stdout.strip()
+    if not output:
+        return []
+
+    payload = json.loads(output)
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+
+    normalized_items: list[dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        normalized_items.append(
+            {
+                "name": str(item.get("Name", "")).strip(),
+                "shortcut_path": str(item.get("ShortcutPath", "")).strip(),
+                "target_path": str(item.get("TargetPath", "")).strip(),
+                "arguments": str(item.get("Arguments", "")).strip(),
+            }
+        )
+
+    return normalized_items
+
+
 class InstalledAppScanner:
     def __init__(self, log_callback: Optional[Callable[[str, str], None]] = None) -> None:
         self.log_callback = log_callback
@@ -281,6 +400,9 @@ class InstalledAppScanner:
 
         self._log("INFO", "Scanning Windows uninstall registry")
         self._scan_uninstall_entries(discovered_by_name, discovered_commands)
+
+        self._log("INFO", "Scanning Brave and Chrome web-app shortcuts")
+        self._scan_browser_web_app_shortcuts(discovered_by_name, discovered_commands)
 
         return sorted(discovered_by_name.values(), key=lambda entry: normalize_name(entry.name))
 
@@ -410,6 +532,59 @@ class InstalledAppScanner:
 
         discovered_by_name[normalized_name_key] = AppEntry(name=cleaned_name, path=command_text)
         discovered_commands.add(normalized_command_key)
+
+    def _scan_browser_web_app_shortcuts(
+        self,
+        discovered_by_name: dict[str, AppEntry],
+        discovered_commands: set[str],
+    ) -> None:
+        try:
+            shortcuts = _read_shortcuts_via_powershell(get_shortcut_scan_roots())
+        except FileNotFoundError:
+            self._log("WARNING", "PowerShell was not found, so Brave/Chrome web-app scan was skipped")
+            return
+        except subprocess.TimeoutExpired:
+            self._log("WARNING", "Shortcut scan timed out before Brave/Chrome web apps could be imported")
+            return
+        except subprocess.CalledProcessError as exc:
+            error_text = exc.stderr.strip() or str(exc)
+            self._log("WARNING", f"Shortcut scan failed: {error_text}")
+            return
+        except json.JSONDecodeError as exc:
+            self._log("WARNING", f"Shortcut scan returned unreadable data: {exc}")
+            return
+
+        for shortcut in shortcuts:
+            target_text = shortcut.get("target_path", "")
+            arguments = shortcut.get("arguments", "")
+            shortcut_name = shortcut.get("name", "")
+            if not target_text or not shortcut_name:
+                continue
+
+            target_path = Path(target_text)
+            if not _is_browser_web_app_shortcut(target_path, arguments):
+                continue
+
+            command_parts = [str(target_path)]
+            try:
+                if arguments:
+                    command_parts.extend(_split_argument_text(arguments))
+            except ValueError:
+                continue
+
+            command_text = subprocess.list2cmdline(command_parts)
+            try:
+                normalized_command, executable_path = normalize_launch_command(command_text)
+            except ValueError:
+                continue
+
+            self._register_discovered_entry(
+                discovered_by_name,
+                discovered_commands,
+                _clean_browser_web_app_name(shortcut_name),
+                normalized_command,
+                executable_path,
+            )
 
     def _log(self, level: str, message: str) -> None:
         if self.log_callback is not None:
